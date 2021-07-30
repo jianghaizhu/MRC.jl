@@ -1,17 +1,31 @@
-
 function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     occursin(r".+\.mrcs?$", filename) || error("The input file does not have an expected MRC extension.")
 
-    isStack = occursin(r".+\.mrcs$", filename)
-
     file = open(filename)
+
+    # MRC header
     head = MRCmeta()
-
     head["Filename"] = filename
+    head = readMRCheader(file, head)
+    head = readMRCextendedheader(file, head)
 
-    #The main header of MRC file is 1024 bytes in length.
+    # MRC image data
+    img = readMRCimage(file, head, startSlice, numSlices)
 
-    # Read the first 10 entries, which are integers.
+    close(file)
+
+    return MRCImg(img, head)
+end
+
+#=
+    Create an array of type arrayType and length arrayLength.
+=#
+createarray(arrayType::Type, arrayLength) = return Array{arrayType}(undef, arrayLength)
+
+#=
+    Read the first 10 entries of the MRC header, which are integers.
+=#
+function readlayout(file::IOStream, head::Dict{String, Any})
     #  1 (1-4 bytes):   NX (number of columns, fastest changing in map)
     #  2 (4-8):         NY (number of rows)
     #  3 (9-12):        NZ (number of sections, slowest changing in map)
@@ -25,7 +39,8 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     #  9 (33-36):       MY (number of intervals along Y)
     # 10 (37-40):       MZ (number of intervals along Z; In EM, where there is no unit cell. MZ represents the number
     #                        of sections in a single volume. For a volume stack, NZ/MZ will the number of volumes in the stack)
-    layout  = read(file, Int32, 10)
+    layout = createarray(Int32, 10)
+    read!(file, layout)
 
     head["NX"]       = layout[1]
     head["NY"]       = layout[2]
@@ -38,7 +53,13 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     head["MY"]       = layout[9]
     head["MZ"]       = layout[10]
 
-    # Read the next 12 entries, which are floats.
+    return head
+end
+
+#=
+    Read the next 12 entries of the MRC header, which are floats.
+=#
+function readaxes(file::IOStream, head::Dict{String, Any})
     # 11,12,13 (41-52): the first three are the cell dimensions in angstroms: CELLA (A B C)
     # 14,15,16 (53-64): the next three are cell angles in degrees: CELLB (α β γ)
     # 17 (65-68):       MAPC (axis corresponding to columns: 1,2,3 for X,Y,Z)
@@ -47,7 +68,8 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     # 20 (77-80):       DMIN (minimum density value)
     # 21 (81-84):       DMAX (maximum density value)
     # 22 (85-88):       DMEAN (mean density value)
-    axes = read(file, Float32, 12)
+    axes = createarray(Float32, 12)
+    read!(file, axes)
 
     head["CELL_A"]     = axes[1]
     head["CELL_B"]     = axes[2]
@@ -62,7 +84,13 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     head["DMAX"]       = axes[11]
     head["DMEAN"]      = axes[12]
 
-    # Read the next 27 entires, which are integers.
+    return head
+end
+
+#=
+    Read the next 27 entries of the MRC header, which are integers.
+=#
+function readspace(file::IOStream, head::Dict{String, Any})
     # 23 (89-92):       ISPG, space group number. Spacegroup 0 implies a 2D image or image stack.
     #                   For crystallography, ISPG represents the actual spacegroup. For single volumes
     #                   from EM/ET, the spacegroup should be 1. For volume stacks, we adopt the convention
@@ -75,16 +103,29 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     # 28 (109-112):     NVERSION, version of the MRC format. The version of the MRC format that the file
     #                   adheres to, specified as: Year * 10 + version within the year (base 0). At the time
     #                   of this writing, the current format would have the value: 20140.
-    space = read(file, Int32, 4)
+    space = createarray(Int32, 4)
+    read!(file, space)
+
     head["ISPG"]         = space[1]
     head["NSYMBT"]       = space[2]
     head["EXTRA_SPACE1"] = space[3:4]
-    head["EXTTYPE"]      = String(read(file, UInt8, 4)) # Read in the C-style chars as UInt8 and convert them to an String
-    space = read(file, Int32, 22)
+    
+    # Read in the C-style chars as UInt8 and convert them to an String
+    head["EXTTYPE"]      = String(read(file, 4))
+    
+    space = createarray(Int32, 22)
+    read!(file, space)
+
     head["NVERSION"]     = space[1]
     head["EXTRA_SPACE2"] = space[2:22]
 
-    # Read the next 3 entires, which are floats.
+    return head
+end
+
+#=
+    Read the next 3 entries of the MRC header, which are floats.
+=#
+function readorigin(file::IOStream, head::Dict{String, Any})
     # 50-52 (197-208):  ORIGIN (X Y Z), phase origin (pixels) or origin of subvolume (A).
     #                   For transforms (Mode 3 or 4):
     #                       ORIGIN is the phase origin of the transformed image in pixels, e.g. as used in
@@ -98,37 +139,60 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     #                       containing the subvolume (red rectangle) would contain ORIGIN = 100, 120 to
     #                       specify its position with respect to the original volume (assuming the original
     #                       volume has its own ORIGIN set to 0, 0).
-    origin = read(file, Float32, 3)
+    origin = createarray(Float32, 3)
+    read!(file, origin)
+
     head["ORIGIN_X"] = origin[1]
     head["ORIGIN_Y"] = origin[2]
     head["ORIGIN_Z"] = origin[3]
 
+    return head
+end
+
+#=
+    Read main header of MRC file.
+=#
+function readMRCheader(file::IOStream, head::Dict{String, Any})
+    # The main header of MRC file is 1024 bytes in length.
+
+    head = readlayout(file, head)   # Read the first 10 entries, which are integers.
+    head = readaxes(file, head)     # Read the next 12 entries, which are floats.
+    head = readspace(file, head)    # Read the next 27 entries, which are integers.
+    head = readorigin(file, head)   # Read the next 3 entries, which are floats.
+
     # Read entries 53 and 54, which are text.
-    # 53 (209-212):   MAP, Character string ‘MAP ’ to identify file type.
-    # 54 (213-216):   MACHST, Machine stamp.
-    head["MAP"]    = String(read(file, UInt8, 4))
-    head["MACHST"] = String(read(file, UInt8, 4))
+    head["MAP"]      = String(read(file, 4))    # 53 (209-212): MAP, Character string ‘MAP ’ to identify file type.
+    head["MACHST"]   = String(read(file, 4))    # 54 (213-216): MACHST, Machine stamp.
 
     # Read entry 55, which is a float.
-    # 55 (217-220):   RMS, rms deviation of map from mean density.
-    head["RMS"]   = read(file, Float32, 1)[1]
+    head["RMS"]   = Float32(read(file, 4)[1])   # 55 (217-220): RMS, rms deviation of map from mean density.
 
     # Read entry 56, which is an integer.
-    # 56 (221-224):   NLABL, number of labels being used.
-    head["NLABL"] = read(file, Int32, 1)[1]
+    head["NLABL"] = Int32(read(file, 4)[1])     # 56 (221-224): NLABL, number of labels being used.
 
     # Read entries 57 to 256, which are text.
-    # 57-256 (225-1024):    LABEL(20,10), 10 80-character text labels.
-    head["LABEL"] = String(read(file, UInt8, 10*80))
+    head["LABEL"] = String(read(file, 10*80))   # 57-256 (225-1024): LABEL(20,10), 10 80-character text labels.
 
     head["DIM"]   = DIM(head)
 
-    # Read any extended header data.
+    return head
+end
+
+#=
+    Read extended header of MRC file.
+=#
+function readMRCextendedheader(file::IOStream, head::Dict{String, Any})
     # Length of extended header is specified by the `NSYMBT` in terms of number of bytes.
     if head["NSYMBT"] > 0
-        head["EXTHEAD"] = read(file, UInt8, head["NSYMBT"])
+        head["EXTHEAD"] = read(file, head["NSYMBT"])
     end
+    return head
+end
 
+#=
+    Determine pixbytes as specified by `head["MODE"]`.
+=#
+function modepixbytes(head::Dict{String, Any})
     # 0, 8-bit signed integer, -128 to 127.
     if head["MODE"] == 0
         pixbytes = 1
@@ -154,79 +218,93 @@ function readMRC(filename::AbstractString, startSlice::Int=1, numSlices::Int=0)
     elseif head["MODE"] == 16
         error("readMRC: Sorry, RGB image processing is not currently supported.")
     else
-        error("readMRC: Unknown Data Mode: ", head["MODE"])
+        error("readMRC: Unknown Data Mode: $(head["MODE"]).")
     end
+    return pixbytes
+end
 
-    SkipBytes = 0
-    #=
-        If a user wants to read an MRC image starting at a certain slice (startSlice),
-        then the data before the StartSlice needs to be skipped. The size of each
-        slice is NX * NY * pixbytes.
-        If a user only wants to read a certain number of slices, then the number of
-        Slices (numSlices) needs to be defined.
-        If the number of slices a user wants to read is larger than the existing slices,
-        then read the existing slices.
-    =#
+#=
+    If a user wants to read an MRC image starting at a certain slice (startSlice),
+    then the data before the StartSlice needs to be skipped. The size of each
+    slice is NX * NY * pixbytes.
+    If a user only wants to read a certain number of slices, then the number of
+    Slices (numSlices) needs to be defined.
+    If the number of slices a user wants to read is larger than the existing slices,
+    then read the existing slices.
+=#
+function slices(file::IOStream, head::Dict{String, Any}, startSlice::Int, numSlices::Int)
+    pixbytes = modepixbytes(head)
+    zSlices = head["NZ"]
+    skipBytes = 0
+
     if startSlice > 1
         skipBytes = (startSlice - 1) * head["NX"] * head["NY"] * pixbytes
+        zSlices = head["NZ"] - (startSlice - 1)
         skip(file, skipBytes)
     end
 
-    if numSlices == 0
-        zSlices = head["NZ"]
-    else
-        #choose the smaller number between the existing slices and what a user wants.
+    if numSlices > 0
+        # Choose the smaller number between the existing slices and what a user wants.
         zSlices = min((head["NZ"] - (startSlice - 1)), numSlices)
     end
 
-    # ndata = Int64(head["NX"] * head["NY"] * head["NZ"])
+    zSlices = Int(zSlices)
+    skipBytes = Int(skipBytes)
 
-    #=
-        Read image data in the format specified by `head["MODE"]`
-    =#
+    return zSlices, skipBytes
+end
+
+#=
+    Determine the length of the array that holds the image data.
+=#
+function lengtharray(file::IOStream, head::Dict{String, Any}, skipBytes::Int)
+    lengthArray = Int((filesize(file) - head["NSYMBT"] - skipBytes - 1024)/4)
+    return lengthArray
+end
+
+#=
+    Create an array to hold the MRC image data as specified by `head["MODE"]`.
+=#
+function imagearray(head::Dict{String, Any}, lengthArray::Int)
+    if head["MODE"] == 0
+        img = createarray(UInt8, lengthArray)
+    elseif head["MODE"] == 1
+        img = createarray(Int16, lengthArray)
+    elseif head["MODE"] == 2
+        img = createarray(Float32, lengthArray)
+    elseif head["MODE"] == 3
+        img = createarray(Int16, lengthArray)
+    elseif head["MODE"] == 4
+        img = createarray(Pair{Float32}, lengthArray)
+    elseif head["MODE"] == 6
+        img = createarray(UInt16, lengthArray)
+    end
+    return img
+end
+
+#=
+    Read image data in the format specified by `head["MODE"]`.
+=#
+function readMRCimage(file::IOStream, head::Dict{String, Any}, startSlice::Int, numSlices::Int)    
+    zSlices, skipBytes = slices(file, head, startSlice, numSlices)
+    lengthArray = lengtharray(file, head, skipBytes)
+
+    # Error occurs if the number of bytes skipped is greater than the number of bytes for the image data.
+    skipBytes ≤ lengthArray || error("readMRC: Sorry, cannot start at slice $startSlice.")
+    # Error occurs if the dimensions do not equal the number of bytes for the image data.
+    lengthArray == head["NX"] * head["NY"] * zSlices || error("readMRC: Sorry, cannot read $numSlices slices.")
+    
+    img = imagearray(head, lengthArray)
+    read!(file, img)
+
     if head["NZ"] == 1
-        if head["MODE"] == 0
-            img = read(file, UInt8, head["NX"], head["NY"])
-        elseif head["MODE"] == 1
-            img = read(file, Int16, head["NX"], head["NY"])
-        elseif head["MODE"] == 2
-            img = read(file, Float32, head["NX"], head["NY"])
-        elseif head["MODE"] == 3
-            img = read(file, Int16, head["NX"], head["NY"])
-        elseif head["MODE"] == 4
-            img = read(file, Pair{Float32}, head["NX"], head["NY"])
-        elseif head["MODE"] == 6
-            img = read(file, UInt16, head["NX"], head["NY"])
-        end
         # MRC is row major, permute dims 1 and 2 to make it column major
+        img = reshape(img, head["NY"], head["NX"])
         img = permutedims(img, [2, 1])
     else
-        if head["MODE"] == 0
-            img = read(file, UInt8, head["NX"], head["NY"], zSlices)
-        elseif head["MODE"] == 1
-            img = read(file, Int16, head["NX"], head["NY"], zSlices)
-        elseif head["MODE"] == 2
-            img = read(file, Float32, head["NX"], head["NY"], zSlices)
-        elseif head["MODE"] == 3
-            img = read(file, Int16, head["NX"], head["NY"], zSlices)
-        elseif head["MODE"] == 4
-            img = read(file, Pair{Float32}, head["NX"], head["NY"], zSlices)
-        elseif head["MODE"] == 6
-            img = read(file, UInt16, head["NX"], head["NY"], zSlices)
-        end
         # MRC is row major, permute dims 1 and 2 to make it column major
+        img = reshape(img, head["NY"], head["NX"], zSlices)
         img = permutedims(img, [2, 1, 3])
     end
-
-    close(file)
-
-#    if isStack && (head["DIM"] != 1)
-#        println("WARNING: Metadata indicates that this is NOT an image stack.")
-#        println("However, the file is using the extension '.mrcs'. Please be sure to remedy the situation.")
-#    elseif !isStack && (head["DIM"] == 1)
-#        println("WARNING: Metadata indicates that this is an image stack.")
-#        print("However, the file is NOT using the extension '.mrcs'.")
-#        println("Please be sure to remedy the situation.")
-#    end
-    return MRCImg(img, head)
+    return img
 end
